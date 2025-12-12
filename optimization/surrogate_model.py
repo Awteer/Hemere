@@ -14,10 +14,10 @@ def estimate_spar_weight(EI, diameter_mm, safety_factor=1.03):
         float: 桁の線密度 [kg/m]
     """
     # 100万回のモンテカルロシミュレーション(Top 1.0% Elite)から導出された係数
-    A = 1.890215e-09
-    B = 0.826560
-    C = -1.296560
-    D = 0.000059
+    A = 8.965842e-08
+    B = 0.886044
+    C = -1.400146
+    D = 0.057886
 
     # サロゲートモデル式: Weight = A * EI^B * R^C + D
     # ※EIは N*mm^2, diameter_mm は mm
