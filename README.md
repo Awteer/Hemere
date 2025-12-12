@@ -1,1 +1,2 @@
-末端技研開発の設計ソフト 
+HPA Design Software Hemere
+Developing by Shinnnosuke Wada
