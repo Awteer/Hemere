@@ -139,7 +139,7 @@ def train_spar_surrogate():
     # パイプラインにしておくと後で便利
     model = Pipeline([
         ('rf', RandomForestRegressor(
-            n_estimators=300,    # 木の数（多いほど安定）
+            n_estimators=1000,    # 木の数（多いほど安定）
             max_depth=None,      # 深さ制限なし（複雑なパレート境界に追従させる）
             min_samples_leaf=1,  # 細かい階段状の変化を許容
             random_state=42,
