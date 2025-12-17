@@ -1,154 +1,127 @@
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import itertools
 from tqdm import tqdm
 import os
 import sys
+from joblib import Parallel, delayed
 
-# プロジェクトルートにパスを通す（VSCode実行対策）
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 
 from src.core.spar_calculator import SparCalculator
+from src.core.brazier_calculator import BrazierCalculator
 
-# ==========================================
-# 1. 全探索データ生成 (Full Search)
-# ==========================================
-def generate_full_search_dataset():
-    calc = SparCalculator()
-    
-    # 直径範囲: 30mm 〜 130mm
-    diameters = np.arange(30.0, 131.0, 2.0)
-    
-    # 積層パターンの生成 (一度だけ計算)
-    # Base層 (Index 2): 0 ~ 9枚
-    base_options = range(10)
-    # Cap層 (Index 3~9): 0 ~ 2枚 (3^7 = 2187通り)
-    cap_options = list(itertools.product(range(3), repeat=7))
-    
-    print(f"全積層構成を作成しています...")
-    print(f"直径: {len(diameters)} ステップ:30-130mm)")
-    print(f"直径毎に評価: {len(base_options) * len(cap_options):,}パターン")
-    
-    # 結果格納用リスト
-    # メモリ節約のため、辞書リストではなくリストのリストを使う等の最適化も可能だが、
-    # 今回は可読性重視で辞書リストを使用
-    all_data = []
+# ファイルパス設定
+RAW_DATA_PATH = os.path.join("data", "interim", "raw_spar_dataset_brazier.csv")
+PROCESSED_DATA_PATH = os.path.join("data", "processed", "pareto_spar_dataset_brazier.csv")
 
-    # プログレスバーで進捗表示
-    for D in tqdm(diameters, desc="Processing Diameters"):
+class DatasetGenerator:
+    def __init__(self):
+        self.spar_calc = SparCalculator()
+        self.brazier_calc = BrazierCalculator(knockdown_factor=0.5)
+
+    def calculate_full_spec(self, ply_counts, diameter):
+        # 1. SparCalculator (厳密な重量・剛性)
+        EI_kgf, Weight_kg_m, T_total = self.spar_calc.calculate_spec(ply_counts, diameter)
+        EI_Nmm2 = EI_kgf * 9.80665 # 単位換算
         
-        # 毎回インスタンス化せず、計算用の変数を使い回す
-        ply_counts = np.zeros(11, dtype=int)
-        ply_counts[0] = 1   # Glass
-        ply_counts[10] = 1  # Glass
-        ply_counts[1] = 2   # Torque (2枚固定)
+        # 2. BrazierCalculator (積分法による座屈強度)
+        Mcrit_Nmm = self.brazier_calc.calculate_max_moment_integral(
+            diameter, 
+            ply_counts, 
+            self.spar_calc.ply_angles
+        )
+        return EI_Nmm2, Weight_kg_m, Mcrit_Nmm, T_total
 
-        for base_ply in base_options:
-            ply_counts[2] = base_ply
+def process_diameter_base_pair(D, base_ply, cap_options, generator):
+    local_results = []
+    
+    fixed_glass_in = 1
+    fixed_torque = 2
+    fixed_glass_out = 1
+    
+    ply_counts = np.zeros(11, dtype=int)
+    ply_counts[0] = fixed_glass_in
+    ply_counts[1] = fixed_torque
+    ply_counts[2] = base_ply
+    ply_counts[10] = fixed_glass_out
+    
+    for cap_config in cap_options:
+        for i, count in enumerate(cap_config):
+            ply_counts[3+i] = count
             
-            for cap_config in cap_options:
-                ply_counts[3:10] = cap_config
-                
-                # 計算
-                EI, W, t_total = calc.calculate_spec(ply_counts, D)
-                
-                # 結果追加 (軽量化のためPlyConfigは文字列化せず必要な時だけ復元する運用もアリだが、今回は含める)
-                all_data.append({
-                    "EI": EI,
-                    "R": D,
-                    "Weight": W,
-                    "Thickness": t_total,
-                    "PlyConfig": str(ply_counts.tolist())
-                })
-    
-    df = pd.DataFrame(all_data)
-    print(f"合計作成点数: {len(df):,}")
-    return df
+        EI, W, Mcrit, T = generator.calculate_full_spec(ply_counts, D)
+        
+        local_results.append({
+            "R": D,
+            "EI": EI,
+            "Mcrit": Mcrit,
+            "Weight": W,
+            "BasePly": base_ply,
+            "Thickness": T
+        })
+        
+    return local_results
 
-# ==========================================
-# 2. ビニング & フィルタリング (Pareto Optimization)
-# ==========================================
-def filter_best_dataset(df, bins=300):
-    """
-    剛性(LogEI)で細かくビン分割し、
-    【各直径(R) × 各剛性ビン】 の組み合わせにおける最軽量設計を残す。
-    (Local Optimumを残す設定)
-    """
-    print("Filtering Local Pareto Frontier (Best Weight per R & Stiffness Bin)...")
+def generate_and_filter_dataset():
+    # ==========================================
+    # 1. RAWデータの生成 or 読み込み
+    # ==========================================
+    if os.path.exists(RAW_DATA_PATH):
+        print(f"Found existing raw data at: {RAW_DATA_PATH}")
+        print("Skipping generation and loading raw data...")
+        raw_df = pd.read_csv(RAW_DATA_PATH)
+    else:
+        print("Generating Dataset (Parallel Processing)...")
+        generator = DatasetGenerator()
+        
+        diameters = np.arange(30.0, 131.0, 2.0)
+        base_options = range(10)
+        cap_options = list(itertools.product(range(3), repeat=7))
+        
+        print(f"Combinations: {len(diameters)} Dia x {len(base_options)} Base x {len(cap_options)} Caps")
+        
+        tasks = [(D, base_ply) for D in diameters for base_ply in base_options]
+        
+        results_nested = Parallel(n_jobs=-1, verbose=10)(
+            delayed(process_diameter_base_pair)(D, base, cap_options, generator) 
+            for D, base in tasks
+        )
+        
+        all_data = [item for sublist in results_nested for item in sublist]
+        raw_df = pd.DataFrame(all_data)
+        
+        # RAWデータの保存
+        os.makedirs(os.path.dirname(RAW_DATA_PATH), exist_ok=True)
+        raw_df.to_csv(RAW_DATA_PATH, index=False)
+        print(f"Raw Data saved to: {RAW_DATA_PATH}")
+        
+    print(f"Total Data Points: {len(raw_df):,}")
     
-    # EIの対数をとる
-    df['LogEI'] = np.log10(df['EI'])
+    # ==========================================
+    # 2. フィルタリング (ここだけやり直せる)
+    # ==========================================
+    print("Filtering Pareto Optimal Solutions...")
     
-    # ビン分割
-    df['EI_Bin'] = pd.cut(df['LogEI'], bins=bins)
-    
-    # 【修正箇所】
-    # GroupByに 'R' を追加しました。
-    # これで「ある剛性ビンの中で、直径R=30mmならこれがベスト」「R=31mmならこれがベスト」...
-    # というデータが全て残ります。
-    idx = df.groupby(['R', 'EI_Bin'], observed=True)['Weight'].idxmin()
-    
-    best_df = df.loc[idx.dropna()].copy()
-    
-    # 見やすいようにソート (直径順 -> 剛性順)
-    best_df = best_df.sort_values(['R', 'EI'])
-    
-    print(f"Compressed Dataset Size: {len(best_df):,}")
-    return best_df
+    # EI: Log空間でBinning
+    raw_df['LogEI'] = np.log10(raw_df['EI'] + 1e-9)
+    raw_df['EI_Bin'] = pd.cut(raw_df['LogEI'], bins=200)
 
-# ==========================================
-# Main Execution
-# ==========================================
+    # Mcrit: Log空間でBinning (座屈強度も考慮)
+    raw_df['LogMcrit'] = np.log10(raw_df['Mcrit'] + 1e-9)
+    raw_df['Mcrit_Bin'] = pd.cut(raw_df['LogMcrit'], bins=100)
+    
+    # グルーピング: (直径, EIビン, Mcritビン) で最軽量を残す
+    idx = raw_df.groupby(['R', 'EI_Bin', 'Mcrit_Bin'], observed=True)['Weight'].idxmin()
+    pareto_df = raw_df.loc[idx.dropna()].copy()
+    
+    pareto_df = pareto_df.sort_values(['R', 'EI', 'Mcrit'])
+    
+    print(f"Compressed Dataset Size: {len(pareto_df):,} points")
+    
+    os.makedirs(os.path.dirname(PROCESSED_DATA_PATH), exist_ok=True)
+    pareto_df.to_csv(PROCESSED_DATA_PATH, index=False)
+    print(f"Processed Dataset saved to: {PROCESSED_DATA_PATH}")
+
 if __name__ == "__main__":
-    
-    # 1. データ生成
-    raw_df = generate_full_search_dataset()
-    
-    # 2. フィルタリング
-    # ビン数を増やすと、より滑らかな曲線としてデータが残る
-    pareto_df = filter_best_dataset(raw_df, bins=500)
-    
-    # 3. 保存
-    # 保存先ディレクトリ
-    output_dir = os.path.join("data", "processed")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    csv_path = os.path.join(output_dir, "pareto_spar_dataset_eos_model.csv")
-    pareto_df.to_csv(csv_path, index=False)
-    print(f"Dataset saved to: {csv_path}")
-    
-    # 4. 可視化 (スケール修正版)
-    plt.figure(figsize=(12, 8))
-    
-    # 全データ（薄く背景に）- 重いので間引く
-    sample_raw = raw_df.sample(min(20000, len(raw_df)))
-    plt.scatter(sample_raw['LogEI'], sample_raw['Weight'], c='lightgray', s=1, alpha=0.3, label='Raw Search Space')
-    
-    # パレート解（メイン）
-    sc = plt.scatter(
-        pareto_df['LogEI'], 
-        pareto_df['Weight'], 
-        c=pareto_df['R'], 
-        cmap='viridis', 
-        s=15, 
-        edgecolors='k', 
-        linewidth=0.5,
-        vmin=30, vmax=140,  # ★カラースケールを固定
-        label='Pareto Frontier'
-    )
-    
-    plt.colorbar(sc, label='Diameter R [mm]')
-    plt.xlabel('Log10(EI) [kgf mm^2]')
-    plt.ylabel('Weight [kg/m]')
-    plt.title('Eos Model Training Data (Global Pareto Frontier)')
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    
-    # 画像保存
-    img_path = os.path.join("results", "figures", "dataset_distribution.png")
-    os.makedirs(os.path.dirname(img_path), exist_ok=True)
-    plt.savefig(img_path)
-    print(f"Plot saved to: {img_path}")
-    
-    plt.show() # 必要ならコメントアウト解除
+    generate_and_filter_dataset()
