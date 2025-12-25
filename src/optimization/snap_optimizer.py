@@ -5,6 +5,14 @@ import os
 import sys
 import itertools
 
+# もし学習時に FunctionTransformer(add_physics_features) を使っていた場合、
+# 内部的にこのような名前で保存されている可能性があります。
+class PhysicsFeatureEngineer:
+    def __init__(self, func=None):
+        self.func = func
+    def transform(self, X):
+        return add_physics_features(X)
+
 # プロジェクトルートにパスを通す
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 
