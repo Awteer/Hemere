@@ -6,7 +6,7 @@ from tqdm import tqdm
 import os
 import sys
 
-# プロジェクトルートにパスを通す（VSCode実行対策）
+# プロジェクトルートにパスを通す
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 
 from src.core.spar_calculator import SparCalculator
